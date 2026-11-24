@@ -1275,3 +1275,65 @@ fn deep_phi_deps_do_not_overflow_stack() {
         .expect("spawn bounded-stack thread");
     handle.join().expect("graphics compute_deps overflowed or panicked");
 }
+
+fn ps_shared_root_load_store_chain(steps: u32) -> (Shader, GraphicsIo) {
+    let mut s = Shader::new(Stage::Pixel, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Pixel);
+    let pos = io.input(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+    let _unused = io.input(SigElement::user("TEXCOORD", 0, CompType::F32, 1));
+    let tgt = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
+    let x = io.load_input(&mut s, pos, 0, 0);
+    let f32 = s.m.f32();
+    let arr_ty = s.m.array(u64::from(steps) + 1, f32);
+    let arr = s.m.alloca(arr_ty, 4);
+    let zero = s.m.i32c(0);
+    let one = f(&mut s, 1.0);
+    let p0 = s.m.gep(arr, &[zero, zero]);
+    s.m.store(p0, x, 4);
+    for k in 0..steps {
+        let idx = s.m.i32c(k);
+        let pk = s.m.gep(arr, &[zero, idx]);
+        let ld = s.m.load(pk, 4);
+        let next = s.m.fbin(BinOp::Add, ld, one, 0);
+        let next_idx = s.m.i32c(k + 1);
+        let p_next = s.m.gep(arr, &[zero, next_idx]);
+        s.m.store(p_next, next, 4);
+    }
+    let last_idx = s.m.i32c(steps);
+    let plast = s.m.gep(arr, &[zero, last_idx]);
+    let out = s.m.load(plast, 4);
+    for c in 0..4u8 {
+        io.store_output(&mut s, tgt, 0, c, out);
+    }
+    (s, io)
+}
+
+#[test]
+fn deep_shared_root_loads_borrow_store_list_without_quadratic_children() {
+    let handle = std::thread::Builder::new()
+        .name("dxil-graphics-load-store-deps-test".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            const STEPS: u32 = 1024;
+            let (mut s, io) = ps_shared_root_load_store_chain(STEPS);
+            s.m.ret();
+            s.m.optimize();
+            let ins = io.place(Dir::In);
+            let outs = io.place(Dir::Out);
+            let prims = io.place(Dir::Prim);
+            let (deps, peak_live_children) = compute_deps_with_peak(&s, &ins, &outs, &prims);
+            for c in 0..4u32 {
+                assert_eq!(deps.out.get(&(0, c)).map(|d| d.iter().copied().collect::<Vec<_>>()), Some(vec![0]));
+            }
+            assert!(
+                peak_live_children <= (STEPS as usize) * 4,
+                "expected linear live child storage, got {peak_live_children} for {STEPS} steps"
+            );
+
+            let (s, io) = ps_shared_root_load_store_chain(STEPS);
+            let c = s.try_finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false }).expect("graphics finish");
+            assert_valid(&c);
+        })
+        .expect("spawn bounded-stack thread");
+    handle.join().expect("graphics shared-root load/store test overflowed or panicked");
+}

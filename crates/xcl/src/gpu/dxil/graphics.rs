@@ -643,6 +643,10 @@ struct Deps {
 /// Input components each value depends on, through data flow, memory and
 /// control dependence (as DXC's `ComputeViewIdState`).
 fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Placed]) -> Deps {
+    compute_deps_with_peak(s, inputs, outputs, prims).0
+}
+
+fn compute_deps_with_peak(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Placed]) -> (Deps, usize) {
     let m = &s.m;
     let nb = m.block_count();
     // Successors and the branch condition of each block.
@@ -829,14 +833,46 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
         Block(usize),
         Val(Value),
     }
-    struct DepFrame {
+    enum DepChildren<'a> {
+        List { items: Vec<DepNode>, next: usize },
+        Values { items: &'a [Value], next: usize },
+    }
+    impl<'a> DepChildren<'a> {
+        fn next_child(&mut self) -> Option<DepNode> {
+            match self {
+                Self::List { items, next } => {
+                    let c = items.get(*next).copied()?;
+                    *next += 1;
+                    Some(c)
+                }
+                Self::Values { items, next } => {
+                    let &v = items.get(*next)?;
+                    *next += 1;
+                    Some(DepNode::Val(v))
+                }
+            }
+        }
+
+        fn owned_len(&self) -> usize {
+            match self {
+                Self::List { items, .. } => items.len(),
+                Self::Values { .. } => 0,
+            }
+        }
+    }
+    struct DepFrame<'a> {
         node: DepNode,
-        children: Vec<DepNode>,
-        next: usize,
+        children: DepChildren<'a>,
         deps: BTreeSet<u32>,
     }
-    fn eval_dep(cx: &Cx, start: DepNode, st: &mut Sets) -> BTreeSet<u32> {
-        let mut stack: Vec<DepFrame> = Vec::new();
+    fn eval_dep<'a>(
+        cx: &Cx<'a>,
+        start: DepNode,
+        st: &mut Sets,
+        peak_children: &mut usize,
+    ) -> BTreeSet<u32> {
+        let mut stack: Vec<DepFrame<'a>> = Vec::new();
+        let mut live_children = 0usize;
         let mut cur = start;
         loop {
             let ready: Option<BTreeSet<u32>> = match cur {
@@ -858,7 +894,10 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
                             Some(Sets::close(&mut st.blocks, b, BTreeSet::new(), st.pass, &mut st.grew))
                         } else {
                             let first = children[0];
-                            stack.push(DepFrame { node: DepNode::Block(b), children, next: 1, deps: BTreeSet::new() });
+                            let children = DepChildren::List { items: children, next: 1 };
+                            live_children += children.owned_len();
+                            *peak_children = (*peak_children).max(live_children);
+                            stack.push(DepFrame { node: DepNode::Block(b), children, deps: BTreeSet::new() });
                             cur = first;
                             continue;
                         }
@@ -872,7 +911,8 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
                             Sets::open(&mut st.values, v);
                             let m = &cx.s.m;
                             let mut d = BTreeSet::new();
-                            let mut children = Vec::new();
+                            let mut list = Vec::new();
+                            let mut first_and_rest: Option<(DepNode, DepChildren<'a>)> = None;
                             match m.inst_info(i) {
                                 InstInfo::Call(name, args) if name.starts_with("dx.op.loadInput.") => {
                                     let id = m.const_u64(args[1]).unwrap() as usize;
@@ -886,42 +926,50 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
                                                 for r in 0..cx.inputs[id].e.nrows() {
                                                     d.insert(base + r * 4 + col);
                                                 }
-                                                children.push(DepNode::Val(args[2]));
+                                                list.push(DepNode::Val(args[2]));
                                             }
                                         }
                                     }
                                 }
                                 InstInfo::Call(_, args) => {
-                                    children.extend(args.iter().map(|&a| DepNode::Val(a)));
+                                    if let Some((&first, rest)) = args.split_first() {
+                                        first_and_rest = Some((DepNode::Val(first), DepChildren::Values { items: rest, next: 0 }));
+                                    }
                                 }
-                                InstInfo::Phi(list) => {
-                                    for &(x, from) in list {
-                                        children.push(DepNode::Val(x));
-                                        children.push(DepNode::Block(from.0 as usize));
+                                InstInfo::Phi(phi_list) => {
+                                    for &(x, from) in phi_list {
+                                        list.push(DepNode::Val(x));
+                                        list.push(DepNode::Block(from.0 as usize));
                                         if let Some(c) = cx.cond[from.0 as usize] {
-                                            children.push(DepNode::Val(c));
+                                            list.push(DepNode::Val(c));
                                         }
                                     }
                                 }
                                 InstInfo::Load(p) => {
-                                    children.push(DepNode::Val(p));
-                                    if let Some(vs) = cx.root_stores.get(&root(cx.s, p)) {
-                                        children.extend(vs.iter().map(|&x| DepNode::Val(x)));
-                                    }
+                                    let stores = cx.root_stores.get(&root(cx.s, p)).map(Vec::as_slice).unwrap_or(&[]);
+                                    first_and_rest = Some((DepNode::Val(p), DepChildren::Values { items: stores, next: 0 }));
                                 }
                                 InstInfo::Other(ops) => {
-                                    children.extend(ops.into_iter().map(DepNode::Val));
+                                    list.extend(ops.into_iter().map(DepNode::Val));
                                 }
                                 InstInfo::Store(..) | InstInfo::Term(..) => {}
                             }
                             let _ = cx.block_of;
-                            if children.is_empty() {
-                                Some(Sets::close(&mut st.values, v, d, st.pass, &mut st.grew))
-                            } else {
-                                let first = children[0];
-                                stack.push(DepFrame { node: DepNode::Val(v), children, next: 1, deps: d });
-                                cur = first;
-                                continue;
+                            if first_and_rest.is_none() && !list.is_empty() {
+                                let first = list[0];
+                                first_and_rest = Some((first, DepChildren::List { items: list, next: 1 }));
+                            }
+                            match first_and_rest {
+                                None => {
+                                    Some(Sets::close(&mut st.values, v, d, st.pass, &mut st.grew))
+                                }
+                                Some((first, children)) => {
+                                    live_children += children.owned_len();
+                                    *peak_children = (*peak_children).max(live_children);
+                                    stack.push(DepFrame { node: DepNode::Val(v), children, deps: d });
+                                    cur = first;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -934,12 +982,12 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
                     return result;
                 };
                 top.deps.extend(result);
-                if top.next < top.children.len() {
-                    cur = top.children[top.next];
-                    top.next += 1;
+                if let Some(next_node) = top.children.next_child() {
+                    cur = next_node;
                     break;
                 }
                 let frame = stack.pop().unwrap();
+                live_children -= frame.children.owned_len();
                 result = match frame.node {
                     DepNode::Block(b) => Sets::close(&mut st.blocks, b, frame.deps, st.pass, &mut st.grew),
                     DepNode::Val(v) => Sets::close(&mut st.values, v, frame.deps, st.pass, &mut st.grew),
@@ -947,15 +995,26 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             }
         }
     }
-    fn block_deps(cx: &Cx, b: usize, st: &mut Sets) -> BTreeSet<u32> {
-        eval_dep(cx, DepNode::Block(b), st)
+    fn block_deps<'a>(
+        cx: &Cx<'a>,
+        b: usize,
+        st: &mut Sets,
+        peak_children: &mut usize,
+    ) -> BTreeSet<u32> {
+        eval_dep(cx, DepNode::Block(b), st, peak_children)
     }
-    fn value_deps(cx: &Cx, v: Value, st: &mut Sets) -> BTreeSet<u32> {
-        eval_dep(cx, DepNode::Val(v), st)
+    fn value_deps<'a>(
+        cx: &Cx<'a>,
+        v: Value,
+        st: &mut Sets,
+        peak_children: &mut usize,
+    ) -> BTreeSet<u32> {
+        eval_dep(cx, DepNode::Val(v), st, peak_children)
     }
 
     let cx = Cx { s, block_of: &block_of, ctrl: &ctrl, cond: &cond, root_stores: &root_stores, in_base: &in_base, inputs };
     let mut out: HashMap<(u8, u32), BTreeSet<u32>> = HashMap::new();
+    let mut peak_children = 0usize;
     let bases = |p: &[Placed]| -> Vec<Option<u32>> { p.iter().map(|e| e.at.map(|(r, c)| r * 4 + c as u32)).collect() };
     let (ob, pb) = (bases(outputs), bases(prims));
     // (code without a loop is done after one pass: nothing was cut)
@@ -976,10 +1035,10 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
                 let Some(base) = base[id] else { continue };
                 let col = m.const_u64(args[3]).unwrap() as u32;
                 let row = m.const_u64(args[2]).unwrap() as u32;
-                let mut d = value_deps(&cx, args[4], &mut sets);
-                d.extend(block_deps(&cx, b, &mut sets));
+                let mut d = value_deps(&cx, args[4], &mut sets, &mut peak_children);
+                d.extend(block_deps(&cx, b, &mut sets, &mut peak_children));
                 if args.len() > 5 {
-                    d.extend(value_deps(&cx, args[5], &mut sets));
+                    d.extend(value_deps(&cx, args[5], &mut sets, &mut peak_children));
                 }
                 out.entry((dir, base + row * 4 + col)).or_default().extend(d);
             }
@@ -988,7 +1047,7 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             break;
         }
     }
-    Deps { out }
+    (Deps { out }, peak_children)
 }
 
 /// The global (or other base) a pointer is derived from.
