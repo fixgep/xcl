@@ -824,79 +824,134 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
         in_base: &'a [Option<u32>],
         inputs: &'a [Placed],
     }
+    #[derive(Clone, Copy)]
+    enum DepNode {
+        Block(usize),
+        Val(Value),
+    }
+    struct DepFrame {
+        node: DepNode,
+        children: Vec<DepNode>,
+        next: usize,
+        deps: BTreeSet<u32>,
+    }
+    fn eval_dep(cx: &Cx, start: DepNode, st: &mut Sets) -> BTreeSet<u32> {
+        let mut stack: Vec<DepFrame> = Vec::new();
+        let mut cur = start;
+        loop {
+            let ready: Option<BTreeSet<u32>> = match cur {
+                DepNode::Block(b) => {
+                    if let Some(d) = Sets::known(&st.blocks, &b, st.pass, &mut st.cut) {
+                        Some(d)
+                    } else {
+                        Sets::open(&mut st.blocks, b);
+                        let mut children = Vec::new();
+                        for &a in &cx.ctrl[b] {
+                            if let Some(c) = cx.cond[a] {
+                                children.push(DepNode::Val(c));
+                            }
+                            if a != b {
+                                children.push(DepNode::Block(a));
+                            }
+                        }
+                        if children.is_empty() {
+                            Some(Sets::close(&mut st.blocks, b, BTreeSet::new(), st.pass, &mut st.grew))
+                        } else {
+                            let first = children[0];
+                            stack.push(DepFrame { node: DepNode::Block(b), children, next: 1, deps: BTreeSet::new() });
+                            cur = first;
+                            continue;
+                        }
+                    }
+                }
+                DepNode::Val(v) => match v {
+                    Value::Inst(i) => {
+                        if let Some(d) = Sets::known(&st.values, &v, st.pass, &mut st.cut) {
+                            Some(d)
+                        } else {
+                            Sets::open(&mut st.values, v);
+                            let m = &cx.s.m;
+                            let mut d = BTreeSet::new();
+                            let mut children = Vec::new();
+                            match m.inst_info(i) {
+                                InstInfo::Call(name, args) if name.starts_with("dx.op.loadInput.") => {
+                                    let id = m.const_u64(args[1]).unwrap() as usize;
+                                    let col = m.const_u64(args[3]).unwrap() as u32;
+                                    if let Some(base) = cx.in_base[id] {
+                                        match m.const_u64(args[2]) {
+                                            Some(r) => {
+                                                d.insert(base + r as u32 * 4 + col);
+                                            }
+                                            None => {
+                                                for r in 0..cx.inputs[id].e.nrows() {
+                                                    d.insert(base + r * 4 + col);
+                                                }
+                                                children.push(DepNode::Val(args[2]));
+                                            }
+                                        }
+                                    }
+                                }
+                                InstInfo::Call(_, args) => {
+                                    children.extend(args.iter().map(|&a| DepNode::Val(a)));
+                                }
+                                InstInfo::Phi(list) => {
+                                    for &(x, from) in list {
+                                        children.push(DepNode::Val(x));
+                                        children.push(DepNode::Block(from.0 as usize));
+                                        if let Some(c) = cx.cond[from.0 as usize] {
+                                            children.push(DepNode::Val(c));
+                                        }
+                                    }
+                                }
+                                InstInfo::Load(p) => {
+                                    children.push(DepNode::Val(p));
+                                    if let Some(vs) = cx.root_stores.get(&root(cx.s, p)) {
+                                        children.extend(vs.iter().map(|&x| DepNode::Val(x)));
+                                    }
+                                }
+                                InstInfo::Other(ops) => {
+                                    children.extend(ops.into_iter().map(DepNode::Val));
+                                }
+                                InstInfo::Store(..) | InstInfo::Term(..) => {}
+                            }
+                            let _ = cx.block_of;
+                            if children.is_empty() {
+                                Some(Sets::close(&mut st.values, v, d, st.pass, &mut st.grew))
+                            } else {
+                                let first = children[0];
+                                stack.push(DepFrame { node: DepNode::Val(v), children, next: 1, deps: d });
+                                cur = first;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => Some(BTreeSet::new()),
+                },
+            };
+            let mut result = ready.unwrap();
+            loop {
+                let Some(top) = stack.last_mut() else {
+                    return result;
+                };
+                top.deps.extend(result);
+                if top.next < top.children.len() {
+                    cur = top.children[top.next];
+                    top.next += 1;
+                    break;
+                }
+                let frame = stack.pop().unwrap();
+                result = match frame.node {
+                    DepNode::Block(b) => Sets::close(&mut st.blocks, b, frame.deps, st.pass, &mut st.grew),
+                    DepNode::Val(v) => Sets::close(&mut st.values, v, frame.deps, st.pass, &mut st.grew),
+                };
+            }
+        }
+    }
     fn block_deps(cx: &Cx, b: usize, st: &mut Sets) -> BTreeSet<u32> {
-        if let Some(d) = Sets::known(&st.blocks, &b, st.pass, &mut st.cut) {
-            return d;
-        }
-        Sets::open(&mut st.blocks, b);
-        let mut d = BTreeSet::new();
-        for &a in &cx.ctrl[b] {
-            if let Some(c) = cx.cond[a] {
-                d.extend(value_deps(cx, c, st));
-            }
-            if a != b {
-                d.extend(block_deps(cx, a, st));
-            }
-        }
-        Sets::close(&mut st.blocks, b, d, st.pass, &mut st.grew)
+        eval_dep(cx, DepNode::Block(b), st)
     }
     fn value_deps(cx: &Cx, v: Value, st: &mut Sets) -> BTreeSet<u32> {
-        let Value::Inst(i) = v else { return BTreeSet::new() };
-        if let Some(d) = Sets::known(&st.values, &v, st.pass, &mut st.cut) {
-            return d;
-        }
-        Sets::open(&mut st.values, v);
-        let m = &cx.s.m;
-        let mut d = BTreeSet::new();
-        match m.inst_info(i) {
-            InstInfo::Call(name, args) if name.starts_with("dx.op.loadInput.") => {
-                let id = m.const_u64(args[1]).unwrap() as usize;
-                let col = m.const_u64(args[3]).unwrap() as u32;
-                if let Some(base) = cx.in_base[id] {
-                    match m.const_u64(args[2]) {
-                        Some(r) => {
-                            d.insert(base + r as u32 * 4 + col);
-                        }
-                        None => {
-                            for r in 0..cx.inputs[id].e.nrows() {
-                                d.insert(base + r * 4 + col);
-                            }
-                            d.extend(value_deps(cx, args[2], st));
-                        }
-                    }
-                }
-            }
-            InstInfo::Call(_, args) => {
-                for &a in args {
-                    d.extend(value_deps(cx, a, st));
-                }
-            }
-            InstInfo::Phi(list) => {
-                for &(x, from) in list {
-                    d.extend(value_deps(cx, x, st));
-                    d.extend(block_deps(cx, from.0 as usize, st));
-                    if let Some(c) = cx.cond[from.0 as usize] {
-                        d.extend(value_deps(cx, c, st));
-                    }
-                }
-            }
-            InstInfo::Load(p) => {
-                d.extend(value_deps(cx, p, st));
-                if let Some(vs) = cx.root_stores.get(&root(cx.s, p)) {
-                    for &x in vs {
-                        d.extend(value_deps(cx, x, st));
-                    }
-                }
-            }
-            InstInfo::Other(ops) => {
-                for x in ops {
-                    d.extend(value_deps(cx, x, st));
-                }
-            }
-            InstInfo::Store(..) | InstInfo::Term(..) => {}
-        }
-        let _ = cx.block_of;
-        Sets::close(&mut st.values, v, d, st.pass, &mut st.grew)
+        eval_dep(cx, DepNode::Val(v), st)
     }
 
     let cx = Cx { s, block_of: &block_of, ctrl: &ctrl, cond: &cond, root_stores: &root_stores, in_base: &in_base, inputs };
