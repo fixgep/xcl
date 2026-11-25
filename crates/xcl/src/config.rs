@@ -269,6 +269,9 @@ pub fn parse_device_type(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// Opt-in process commit cap environment variable (`N` MiB; unset or `0` disables).
+/// Relies on native Windows Job Object (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`) enforcement; under
+/// Wine/Linux, use cgroup `MemoryMax` and/or an external free-RAM guard instead.
 pub const ENV_TITLE_COMMIT_CAP_MB: &str = "XCL_TITLE_COMMIT_CAP_MB";
 
 /// Parses an opt-in process commit cap in MiB (`XCL_TITLE_COMMIT_CAP_MB`).
