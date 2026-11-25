@@ -525,7 +525,7 @@ fn fetch_call(d: &Decoded) -> bool {
 
 /// VGPRs an instruction writes: `rdna2::vgpr_uses`, with an image load's data registers
 /// counted from its DMASK (the operand tables give four).
-fn vgpr_writes(d: &Decoded) -> Vec<u64> {
+pub(super) fn vgpr_writes(d: &Decoded) -> Vec<u64> {
     let (_, mut w) = rdna2::vgpr_uses(d);
     let n = d.inst.name;
     let dmask_counts = n.starts_with("IMAGE_SAMPLE") || n.starts_with("IMAGE_GATHER4") || n.starts_with("IMAGE_LOAD") || n == "IMAGE_GET_LOD";
@@ -713,7 +713,7 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
 }
 
 /// Successors of each instruction (index); None: unknown (an indirect jump).
-fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
+pub(super) fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
     insts
         .iter()
         .enumerate()
@@ -823,9 +823,14 @@ mod tests {
     const V: u64 = 256;
     type I = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
 
-    fn program(lines: &[I]) -> Vec<Decoded> {
+    fn code(lines: &[I]) -> Vec<u8> {
         let mut bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}"))).collect();
         bytes.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        bytes
+    }
+
+    fn program(lines: &[I]) -> Vec<Decoded> {
+        let bytes = code(lines);
         let mut out = Vec::new();
         let mut off = 0usize;
         while off < bytes.len() {
@@ -859,6 +864,8 @@ mod tests {
     #[test]
     fn a_whole_wave_reduction_reads_its_identity() {
         assert_eq!(reads(&[WWM, MASK, SEED, X1, MIRROR, PX16, COMBINE, READ32, RESTORE]), vec![Read::Const(u32::MAX)]);
+        assert!(super::super::needs_upper_lanes(&code(&[WWM, MASK, SEED, X1, MIRROR, PX16, COMBINE, READ32, RESTORE])));
+        assert!(!super::super::needs_upper_lanes(&code(&[])));
     }
 
     #[test]

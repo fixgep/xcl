@@ -225,6 +225,16 @@ static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploa
 const STAGING_MIN: u64 = 4 << 20;
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 
+fn staging_capacity(bytes: u64) -> Option<u64> {
+    const LARGE: u64 = 64 << 20;
+    const STEP: u64 = 16 << 20;
+    if bytes <= LARGE {
+        Some(bytes.max(STAGING_MIN).next_power_of_two())
+    } else {
+        bytes.checked_next_multiple_of(STEP)
+    }
+}
+
 impl Uploader {
     unsafe fn new(dev: &ID3D12Device) -> Result<Uploader, String> {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
@@ -241,7 +251,10 @@ impl Uploader {
                 return Ok((b.clone(), *p));
             }
         }
-        let cap = bytes.max(STAGING_MIN).next_power_of_two();
+        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        // A cached uploader has passed its last copy fence. Return this reference before
+        // acquiring the replacement so the growth path does not keep two buffers itself.
+        drop(self.staging.take());
         let b = buffer(dev, cap)?;
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
@@ -794,6 +807,167 @@ mod tests {
                 buffers.push(kept().expect("the queue's upload buffer is kept"));
             }
             assert_eq!(buffers[0], buffers[1], "the second batch made a new upload buffer");
+        }
+    }
+
+    #[test]
+    fn large_staging_uses_sixteen_mib_growth_steps() {
+        let mib = 1 << 20;
+        assert_eq!(staging_capacity(1), Some(4 * mib));
+        assert_eq!(staging_capacity(33 * mib), Some(64 * mib));
+        assert_eq!(staging_capacity(64 * mib + 1), Some(80 * mib));
+        assert_eq!(staging_capacity(138_713_408), Some(144 * mib));
+        assert_eq!(staging_capacity(256 * mib + 1), Some(272 * mib));
+        assert_eq!(staging_capacity(u64::MAX), None);
+    }
+
+    fn select_large_upload_device_with<F, D>(
+        selector: &crate::gpu::adapter::Selector,
+        make_factory: impl FnOnce() -> Result<F, String>,
+        warp_device: impl FnOnce(&F) -> Result<D, String>,
+        hardware_device: impl FnOnce(&F, &crate::gpu::adapter::Selector) -> Option<(D, String)>,
+        default_device: impl FnOnce() -> Result<D, String>,
+    ) -> Result<(D, String), String> {
+        match make_factory() {
+            Ok(factory) if *selector == crate::gpu::adapter::Selector::Warp => {
+                warp_device(&factory).map(|dev| (dev, "WARP (software renderer)".to_string()))
+            }
+            Ok(factory) => hardware_device(&factory, selector).ok_or_else(|| "no GPU".to_string()),
+            Err(err) if *selector == crate::gpu::adapter::Selector::Auto => default_device()
+                .map(|dev| (dev, "default D3D12 adapter".to_string()))
+                .map_err(|dev_err| format!("DXGI factory unavailable ({err}); default D3D12 device unavailable ({dev_err})")),
+            Err(err) => Err(format!("DXGI factory unavailable for {selector}: {err}")),
+        }
+    }
+
+    unsafe fn large_upload_device(selector: &crate::gpu::adapter::Selector) -> Result<(ID3D12Device, String), String> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6};
+        select_large_upload_device_with(
+            selector,
+            || CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string()),
+            |factory| {
+                let warp: IDXGIAdapter1 = factory.EnumWarpAdapter().map_err(|e| format!("WARP adapter unavailable: {e}"))?;
+                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).map_err(|e| format!("WARP device unavailable: {e}"))
+            },
+            |factory, sel| {
+                crate::gpu::adapter::candidates(factory, sel).into_iter().find_map(|(a, desc)| {
+                    crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_11_0).ok().map(|dev| (dev, crate::gpu::adapter::name(&desc)))
+                })
+            },
+            || crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0).map_err(|e| e.to_string()),
+        )
+    }
+
+    #[test]
+    fn large_upload_device_selection_handles_factory_fallback_and_selectors() {
+        use crate::gpu::adapter::Selector;
+        // 1. Auto + DXGI_ERROR_UNSUPPORTED falls back to default device.
+        let mut used_default = false;
+        let ok = select_large_upload_device_with(&Selector::Auto, || Err::<(), _>("DXGI_ERROR_UNSUPPORTED (0x887A0004)".into()), |_| unreachable!(), |_, _| unreachable!(), || { used_default = true; Ok(42u32) });
+        assert!(used_default && ok == Ok((42, "default D3D12 adapter".to_string())));
+        // 2. Auto + double failure returns Err without panicking.
+        let err = select_large_upload_device_with(&Selector::Auto, || Err::<(), _>("E_FAIL".into()), |_| unreachable!(), |_, _| unreachable!(), || Err::<u32, _>("no D3D12 device".into()));
+        assert!(err.as_ref().is_err_and(|e| e.contains("E_FAIL") && e.contains("no D3D12 device")));
+        // 3. Explicit XCL_ADAPTER filter + factory error must not ignore filter via default fallback.
+        for sel in [Selector::Name("rtx".into()), Selector::Index(1), Selector::Warp] {
+            let mut fallback = false;
+            let res = select_large_upload_device_with(&sel, || Err::<(), _>("DXGI_ERROR_UNSUPPORTED".into()), |_| unreachable!(), |_, _| unreachable!(), || { fallback = true; Ok(99u32) });
+            assert!(!fallback && res.is_err());
+        }
+        // 4. Headless CI: Auto + factory ok with 0 hardware adapters skips cleanly without fallback.
+        let mut fallback = false;
+        let none = select_large_upload_device_with(&Selector::Auto, || Ok(()), |_| unreachable!(), |_, _| None::<(u32, String)>, || { fallback = true; Ok(7u32) });
+        assert!(!fallback && none == Err("no GPU".to_string()));
+        // 5. Selector::Warp + factory ok uses EnumWarpAdapter path.
+        let warp = select_large_upload_device_with(&Selector::Warp, || Ok(()), |_| Ok(11u32), |_, _| unreachable!(), || unreachable!());
+        assert_eq!(warp, Ok((11, "WARP (software renderer)".to_string())));
+    }
+
+    #[test]
+    fn gpu_large_mixed_upload_keeps_tight_staging_and_exact_pixels() {
+        use windows::core::Interface;
+
+        unsafe {
+            if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+                match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                    Ok(debug) => debug.EnableDebugLayer(),
+                    Err(error) => println!("D3D12 debug layer unavailable: {error}"),
+                }
+            }
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (dev, adapter_name) = match large_upload_device(&selector) {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    crate::gpu::recomp::runner::skip_test(&reason);
+                    return;
+                }
+            };
+            println!("large upload adapter: {adapter_name}");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let make = |width, height, format| {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: width, Height: height,
+                    DepthOrArraySize: 1, MipLevels: 1, Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+                };
+                let mut out = None::<ID3D12Resource>;
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, SHADER_READ, None, &mut out).unwrap();
+                out.unwrap()
+            };
+            let pixels = |rows: usize, row_bytes: usize, seed: u8| {
+                let data = (0..rows * row_bytes).map(|i| (i as u8).wrapping_mul(31) ^ (i >> 13) as u8 ^ seed).collect();
+                vec![Subresource { depth: 1, rows, row_bytes, data }]
+            };
+            let rgba = (make(8192, 4096, DXGI_FORMAT_R8G8B8A8_UNORM), pixels(4096, 32768, 27), vec![SHADER_READ]);
+            let bc7 = (make(2048, 2048, DXGI_FORMAT_BC7_UNORM), pixels(512, 8192, 91), vec![SHADER_READ]);
+            let key = queue.as_raw() as usize;
+            let kept = || {
+                let guard = UPLOADERS.lock().unwrap();
+                let stage = guard.as_ref().unwrap()[&key].staging.as_ref().unwrap();
+                (stage.0.as_raw() as usize, stage.2)
+            };
+            let batch = [rgba, bc7];
+            assert!(upload_batch(&dev, &queue, &batch[..1]).unwrap().is_empty());
+            let first = kept();
+            let before = std::time::Instant::now();
+            assert!(upload_batch(&dev, &queue, &batch).unwrap().is_empty());
+            let growth = before.elapsed();
+            let grown = kept();
+            for (resource, bytes, _) in &batch {
+                assert!(read_back(&dev, &queue, resource, bytes) == *bytes, "mixed batch pixel mismatch");
+            }
+            let before = std::time::Instant::now();
+            assert!(upload_batch(&dev, &queue, &batch).unwrap().is_empty());
+            let repeat = before.elapsed();
+            let reused = kept();
+            for (resource, bytes, _) in &batch {
+                assert!(read_back(&dev, &queue, resource, bytes) == *bytes, "repeat pixel mismatch");
+            }
+            // Drop the test's large uploader after its last copy fence and readbacks have passed.
+            let uploader = UPLOADERS.lock().unwrap().as_mut().unwrap().remove(&key);
+            drop(uploader);
+            if let Ok(info) = dev.cast::<ID3D12InfoQueue>() {
+                let mut errors = 0;
+                for index in 0..info.GetNumStoredMessagesAllowedByRetrievalFilter() {
+                    let mut size = 0;
+                    info.GetMessage(index, None, &mut size).unwrap();
+                    let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+                    let msg = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    info.GetMessage(index, Some(msg), &mut size).unwrap();
+                    if matches!((*msg).Severity, D3D12_MESSAGE_SEVERITY_ERROR | D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+                        errors += 1;
+                    }
+                }
+                println!("D3D12 debug errors or corruption messages: {errors}");
+                assert_eq!(errors, 0);
+            }
+            println!("large upload: request={} B first_capacity={} B grown_capacity={} B growth={growth:?} repeat={repeat:?} byte_exact=true",
+                (128 + 4) << 20, first.1, grown.1);
+            assert_eq!(first.1, 128 << 20);
+            assert_eq!(grown, reused, "the repeated batch must reuse the staging buffer");
+            assert_eq!(grown.1, 144 << 20, "staging for 132 MiB must fit the next large size class");
         }
     }
 
